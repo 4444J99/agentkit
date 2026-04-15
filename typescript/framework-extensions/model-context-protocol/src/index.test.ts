@@ -1,13 +1,17 @@
 import { z } from "zod";
 import { getMcpTools } from "./index";
-import { AgentKit } from "@coinbase/agentkit";
+import { AgentKit, resolveJsonSchemaRefs } from "@coinbase/agentkit";
 
 // Mock AgentKit before importing - this prevents loading ES-only dependencies
-jest.mock("@coinbase/agentkit", () => ({
-  AgentKit: {
-    from: jest.fn(),
-  },
-}));
+jest.mock("@coinbase/agentkit", () => {
+  const actual = jest.requireActual("@coinbase/agentkit");
+  return {
+    AgentKit: {
+      from: jest.fn(),
+    },
+    resolveJsonSchemaRefs: actual.resolveJsonSchemaRefs,
+  };
+});
 
 // Define mock action after imports
 const mockAction = {
@@ -32,9 +36,42 @@ describe("getMcpTools", () => {
 
     expect(tool.name).toBe(mockAction.name);
     expect(tool.description).toBe(mockAction.description);
-    expect(tool.inputSchema).toStrictEqual(z.toJSONSchema(mockAction.schema));
+    expect(tool.inputSchema).toStrictEqual(
+      resolveJsonSchemaRefs(z.toJSONSchema(mockAction.schema) as Record<string, unknown>),
+    );
 
     const result = await toolHandler("testAction", { test: "data" });
     expect(result).toStrictEqual({ content: [{ text: '"Invoked with data"', type: "text" }] });
+  });
+
+  it("should produce ref-free inputSchema for schemas with shared sub-schemas", async () => {
+    // Reproduces the pattern from issue #815: sub-schema reused in a union
+    const subSchema = z.object({
+      key: z.string(),
+      value: z.string(),
+    });
+
+    const actionWithRefs = {
+      name: "refAction",
+      description: "An action with shared sub-schemas",
+      schema: z.object({
+        direct: subSchema,
+        wrapped: z.array(subSchema),
+      }),
+      invoke: jest.fn(async () => "ok"),
+    };
+
+    (AgentKit.from as jest.Mock).mockImplementation(() => ({
+      getActions: jest.fn(() => [actionWithRefs]),
+    }));
+
+    const mockAgentKit = await AgentKit.from({});
+    const { tools } = await getMcpTools(mockAgentKit);
+
+    const inputSchema = tools[0].inputSchema;
+    const schemaStr = JSON.stringify(inputSchema);
+    expect(schemaStr).not.toContain("$ref");
+    expect(schemaStr).not.toContain("$defs");
+    expect(schemaStr).not.toContain("definitions");
   });
 });
